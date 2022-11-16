@@ -1393,21 +1393,942 @@ func main() {
 
 ##### 改进：闭包函数作为比较函数
 
+在改进之前我们先回顾下Go语言sort包自带的排序函数的接口：
 
+```go
+func Slice(slice interface{}, less func(i, j int) bool)
+```
+
+标准库的sort.Slice因为支持通过闭包函数指定比较函数，对切片的排序非常简单：
+
+```go
+import "sort"
+
+func main() {
+    values := []int32{42, 9, 101, 95, 27, 25}
+
+    sort.Slice(values, func(i, j int) bool {
+        return values[i] < values[j]
+    })
+
+    fmt.Println(values)
+}
+```
+
+我们也尝试将C语言的qsort函数包装为以下格式的Go语言函数：
+
+```go
+package qsort
+
+func Sort(base unsafe.Pointer, num, size int, cmp func(a, b unsafe.Pointer) int)
+```
+
+闭包函数无法导出为C语言函数，因此无法直接将闭包函数传入C语言的qsort函数。 为此我们可以用Go构造一个可以导出为C语言的代理函数，然后通过一个全局变量临时保存当前的闭包比较函数。
+
+代码如下：
+
+```go
+var go_qsort_compare_info struct {
+    fn func(a, b unsafe.Pointer) int
+    sync.Mutex
+}
+
+//export _cgo_qsort_compare
+func _cgo_qsort_compare(a, b unsafe.Pointer) C.int {
+    return C.int(go_qsort_compare_info.fn(a, b))
+}
+```
+
+其中导出的C语言函数`_cgo_qsort_compare`是公用的qsort比较函数，内部通过`go_qsort_compare_info.fn`来调用当前的闭包比较函数。
+
+新的Sort包装函数实现如下：
+
+```go
+/*
+#include <stdlib.h>
+
+typedef int (*qsort_cmp_func_t)(const void* a, const void* b);
+extern int _cgo_qsort_compare(void* a, void* b);
+*/
+import "C"
+
+func Sort(base unsafe.Pointer, num, size int, cmp func(a, b unsafe.Pointer) int) {
+    go_qsort_compare_info.Lock()
+    defer go_qsort_compare_info.Unlock()
+
+    go_qsort_compare_info.fn = cmp
+
+    C.qsort(base, C.size_t(num), C.size_t(size),
+        C.qsort_cmp_func_t(C._cgo_qsort_compare),
+    )
+}
+```
+
+每次排序前，对全局的go_qsort_compare_info变量加锁，同时将当前的闭包函数保存到全局变量，然后调用C语言的qsort函数。
+
+基于新包装的函数，我们可以简化之前的排序代码：
+
+```go
+func main() {
+    values := []int32{42, 9, 101, 95, 27, 25}
+
+    qsort.Sort(unsafe.Pointer(&values[0]), len(values), int(unsafe.Sizeof(values[0])),
+        func(a, b unsafe.Pointer) int {
+            pa, pb := (*int32)(a), (*int32)(b)
+            return int(*pa - *pb)
+        },
+    )
+
+    fmt.Println(values)
+}
+```
+
+现在排序不再需要通过CGO实现C语言版本的比较函数了，可以传入Go语言闭包函数作为比较函数。 但是导入的排序函数依然依赖unsafe包，这是违背Go语言编程习惯的。
+
+##### 改进：消除用户对unsafe包的依赖
+
+前一个版本的qsort.Sort包装函数已经比最初的C语言版本的qsort易用很多，但是依然保留了很多C语言底层数据结构的细节。 现在我们将继续改进包装函数，尝试消除对unsafe包的依赖，并实现一个类似标准库中sort.Slice的排序函数。
+
+新的包装函数声明如下：
+
+```go
+package qsort
+
+func Slice(slice interface{}, less func(a, b int) bool)
+```
+
+首先，我们将slice作为接口类型参数传入，这样可以适配不同的切片类型。 然后切片的首个元素的地址、元素个数和元素大小可以通过reflect反射包从切片中获取。
+
+为了保存必要的排序上下文信息，我们需要在全局包变量增加要排序数组的地址、元素个数和元素大小等信息，比较函数改为less：
+
+```go
+var go_qsort_compare_info struct {
+    base     unsafe.Pointer
+    elemnum  int
+    elemsize int
+    less     func(a, b int) bool
+    sync.Mutex
+}
+```
+
+同样比较函数需要根据元素指针、排序数组的开始地址和元素的大小计算出元素对应数组的索引下标， 然后根据less函数的比较结果返回qsort函数需要格式的比较结果。
+
+```go
+//export _cgo_qsort_compare
+func _cgo_qsort_compare(a, b unsafe.Pointer) C.int {
+    var (
+        // array memory is locked
+        base     = uintptr(go_qsort_compare_info.base)
+        elemsize = uintptr(go_qsort_compare_info.elemsize)
+    )
+
+    i := int((uintptr(a) - base) / elemsize)
+    j := int((uintptr(b) - base) / elemsize)
+
+    switch {
+    case go_qsort_compare_info.less(i, j): // v[i] < v[j]
+        return -1
+    case go_qsort_compare_info.less(j, i): // v[i] > v[j]
+        return +1
+    default:
+        return 0
+    }
+}
+```
+
+新的Slice函数的实现如下：
+
+```go
+func Slice(slice interface{}, less func(a, b int) bool) {
+    sv := reflect.ValueOf(slice)
+    if sv.Kind() != reflect.Slice {
+        panic(fmt.Sprintf("qsort called with non-slice value of type %T", slice))
+    }
+    if sv.Len() == 0 {
+        return
+    }
+
+    go_qsort_compare_info.Lock()
+    defer go_qsort_compare_info.Unlock()
+
+    defer func() {
+        go_qsort_compare_info.base = nil
+        go_qsort_compare_info.elemnum = 0
+        go_qsort_compare_info.elemsize = 0
+        go_qsort_compare_info.less = nil
+    }()
+
+    // baseMem = unsafe.Pointer(sv.Index(0).Addr().Pointer())
+    // baseMem maybe moved, so must saved after call C.fn
+    go_qsort_compare_info.base = unsafe.Pointer(sv.Index(0).Addr().Pointer())
+    go_qsort_compare_info.elemnum = sv.Len()
+    go_qsort_compare_info.elemsize = int(sv.Type().Elem().Size())
+    go_qsort_compare_info.less = less
+
+    C.qsort(
+        go_qsort_compare_info.base,
+        C.size_t(go_qsort_compare_info.elemnum),
+        C.size_t(go_qsort_compare_info.elemsize),
+        C.qsort_cmp_func_t(C._cgo_qsort_compare),
+    )
+}
+```
+
+首先需要判断传入的接口类型必须是切片类型。然后通过反射获取qsort函数需要的切片信息，并调用C语言的qsort函数。
+
+基于新包装的函数我们可以采用和标准库相似的方式排序切片：
+
+```go
+import (
+    "fmt"
+
+    qsort "."
+)
+
+func main() {
+    values := []int64{42, 9, 101, 95, 27, 25}
+
+    qsort.Slice(values, func(i, j int) bool {
+        return values[i] < values[j]
+    })
+
+    fmt.Println(values)
+}
+```
+
+为了避免在排序过程中，排序数组的上下文信息`go_qsort_compare_info`被修改，我们进行了全局加锁。 因此目前版本的qsort.Slice函数是无法并发执行的，读者可以自己尝试改进这个限制。
+
+### CGO内存模型
+
+##### GO访问C内存
+
+C语言空间的内存是稳定的，只要不是被人为提前释放，那么在Go语言空间可以放心大胆地使用。在Go语言访问C语言内存是最简单的情形，我们在之前的例子中已经见过多次。
+
+因为Go语言实现的限制，我们无法在Go语言中创建大于2GB内存的切片（具体请参考makeslice实现代码）。不过借助cgo技术，我们可以在C语言环境创建大于2GB的内存，然后转为Go语言的切片使用：
+
+```go
+package main
+
+/*
+#include <stdlib.h>
+
+void* makeslice(size_t memsize) {
+    return malloc(memsize);
+}
+*/
+import "C"
+import "unsafe"
+
+func makeByteSlize(n int) []byte {
+    p := C.makeslice(C.size_t(n))
+    return ((*[1 << 31]byte)(p))[0:n:n]
+}
+
+func freeByteSlice(p []byte) {
+    C.free(unsafe.Pointer(&p[0]))
+}
+
+func main() {
+    s := makeByteSlize(1<<32+1)
+    s[len(s)-1] = 255
+    print(s[len(s)-1])
+    freeByteSlice(s)
+}
+```
+
+例子中我们通过makeByteSlize来创建大于4G内存大小的切片，从而绕过了Go语言实现的限制（需要代码验证）。而freeByteSlice辅助函数则用于释放从C语言函数创建的切片。
+
+因为C语言内存空间是稳定的，基于C语言内存构造的切片也是绝对稳定的，不会因为Go语言栈的变化而被移动。
+
+##### C临时访问传入的go内存
+
+cgo之所以存在的一大因素是为了方便在Go语言中接纳吸收过去几十年来使用C/C++语言软件构建的大量的软件资源。C/C++很多库都是需要通过指针直接处理传入的内存数据的，因此cgo中也有很多需要将Go内存传入C语言函数的应用场景。
+
+假设一个极端场景：我们将一块位于某goroutinue的栈上的Go语言内存传入了C语言函数后，在此C语言函数执行期间，此goroutinue的栈因为空间不足的原因发生了扩展，也就是导致了原来的Go语言内存被移动到了新的位置。但是此时此刻C语言函数并不知道该Go语言内存已经移动了位置，仍然用之前的地址来操作该内存——这将将导致内存越界。以上是一个推论（真实情况有些差异），也就是说C访问传入的Go内存可能是不安全的！
+
+当然有RPC远程过程调用的经验的用户可能会考虑通过完全传值的方式处理：借助C语言内存稳定的特性，在C语言空间先开辟同样大小的内存，然后将Go的内存填充到C的内存空间；返回的内存也是如此处理。下面的例子是这种思路的具体实现：
+
+```go
+package main
+
+/*
+void printString(const char* s) {
+    printf("%s", s);
+}
+*/
+import "C"
+
+func printString(s string) {
+    cs := C.CString(s)
+    defer C.free(unsafe.Pointer(cs))
+
+    C.printString(cs)
+}
+
+func main() {
+    s := "hello"
+    printString(s)
+}
+```
+
+在需要将Go的字符串传入C语言时，先通过`C.CString`将Go语言字符串对应的内存数据复制到新创建的C语言内存空间上。上面例子的处理思路虽然是安全的，但是效率极其低下（因为要多次分配内存并逐个复制元素），同时也极其繁琐。
+
+为了简化并高效处理此种向C语言传入Go语言内存的问题，cgo针对该场景定义了专门的规则：在CGO调用的C语言函数返回前，cgo保证传入的Go语言内存在此期间不会发生移动，C语言函数可以大胆地使用Go语言的内存！
+
+根据新的规则我们可以直接传入Go字符串的内存：
+
+```go
+package main
+
+/*
+#include<stdio.h>
+
+void printString(const char* s, int n) {
+    int i;
+    for(i = 0; i < n; i++) {
+        putchar(s[i]);
+    }
+    putchar('\n');
+}
+*/
+import "C"
+
+func printString(s string) {
+    p := (*reflect.StringHeader)(unsafe.Pointer(&s))
+    C.printString((*C.char)(unsafe.Pointer(p.Data)), C.int(len(s)))
+}
+
+func main() {
+    s := "hello"
+    printString(s)
+}
+```
+
+现在的处理方式更加直接，且避免了分配额外的内存。完美的解决方案！
+
+任何完美的技术都有被滥用的时候，CGO的这种看似完美的规则也是存在隐患的。我们假设调用的C语言函数需要长时间运行，那么将会导致被他引用的Go语言内存在C语言返回前不能被移动，从而可能间接地导致这个Go内存栈对应的goroutine不能动态伸缩栈内存，也就是可能导致这个goroutine被阻塞。因此，在需要长时间运行的C语言函数（特别是在纯CPU运算之外，还可能因为需要等待其它的资源而需要不确定时间才能完成的函数），需要谨慎处理传入的Go语言内存。
+
+不过需要小心的是在取得Go内存后需要马上传入C语言函数，不能保存到临时变量后再间接传入C语言函数。因为CGO只能保证在C函数调用之后被传入的Go语言内存不会发生移动，它并不能保证在传入C函数之前内存不发生变化。
+
+以下代码是错误的：
+
+```go
+// 错误的代码
+tmp := uintptr(unsafe.Pointer(&x))
+pb := (*int16)(unsafe.Pointer(tmp))
+*pb = 42
+```
+
+因为tmp并不是指针类型，在它获取到Go对象地址之后x对象可能会被移动，但是因为不是指针类型，所以不会被Go语言运行时更新成新内存的地址。在非指针类型的tmp保持Go对象的地址，和在C语言环境保持Go对象的地址的效果是一样的：如果原始的Go对象内存发生了移动，Go语言运行时并不会同步更新它们。
+
+##### C长期持有go指针对象
+
+作为一个Go程序员在使用CGO时潜意识会认为总是Go调用C函数。其实CGO中，C语言函数也可以回调Go语言实现的函数。特别是我们可以用Go语言写一个动态库，导出C语言规范的接口给其它用户调用。当C语言函数调用Go语言函数的时候，C语言函数就成了程序的调用方，Go语言函数返回的Go对象内存的生命周期也就自然超出了Go语言运行时的管理。简言之，我们不能在C语言函数中直接使用Go语言对象的内存。
+
+虽然Go语言禁止在C语言函数中长期持有Go指针对象，但是这种需求是切实存在的。如果需要在C语言中访问Go语言内存对象，我们可以将Go语言内存对象在Go语言空间映射为一个int类型的id，然后通过此id来间接访问和控制Go语言对象。
+
+以下代码用于将Go对象映射为整数类型的ObjectId，用完之后需要手工调用free方法释放该对象ID：
+
+```go
+package main
+
+import "sync"
+
+type ObjectId int32
+
+var refs struct {
+    sync.Mutex
+    objs map[ObjectId]interface{}
+    next ObjectId
+}
+
+func init() {
+    refs.Lock()
+    defer refs.Unlock()
+
+    refs.objs = make(map[ObjectId]interface{})
+    refs.next = 1000
+}
+
+func NewObjectId(obj interface{}) ObjectId {
+    refs.Lock()
+    defer refs.Unlock()
+
+    id := refs.next
+    refs.next++
+
+    refs.objs[id] = obj
+    return id
+}
+
+func (id ObjectId) IsNil() bool {
+    return id == 0
+}
+
+func (id ObjectId) Get() interface{} {
+    refs.Lock()
+    defer refs.Unlock()
+
+    return refs.objs[id]
+}
+
+func (id *ObjectId) Free() interface{} {
+    refs.Lock()
+    defer refs.Unlock()
+
+    obj := refs.objs[*id]
+    delete(refs.objs, *id)
+    *id = 0
+
+    return obj
+}
+```
+
+我们通过一个map来管理Go语言对象和id对象的映射关系。其中NewObjectId用于创建一个和对象绑定的id，而id对象的方法可用于解码出原始的Go对象，也可以用于结束id和原始Go对象的绑定。
+
+下面一组函数以C接口规范导出，可以被C语言函数调用：
+
+```go
+package main
+
+/*
+extern char* NewGoString(char* );
+extern void FreeGoString(char* );
+extern void PrintGoString(char* );
+
+static void printString(const char* s) {
+    char* gs = NewGoString(s);
+    PrintGoString(gs);
+    FreeGoString(gs);
+}
+*/
+import "C"
+
+//export NewGoString
+func NewGoString(s *C.char) *C.char {
+    gs := C.GoString(s)
+    id := NewObjectId(gs)
+    return (*C.char)(unsafe.Pointer(uintptr(id)))
+}
+
+//export FreeGoString
+func FreeGoString(p *C.char) {
+    id := ObjectId(uintptr(unsafe.Pointer(p)))
+    id.Free()
+}
+
+//export PrintGoString
+func PrintGoString(s *C.char) {
+    id := ObjectId(uintptr(unsafe.Pointer(p)))
+    gs := id.Get().(string)
+    print(gs)
+}
+
+func main() {
+    C.printString("hello")
+}
+```
+
+在printString函数中，我们通过NewGoString创建一个对应的Go字符串对象，返回的其实是一个id，不能直接使用。我们借助PrintGoString函数将id解析为Go语言字符串后打印。该字符串在C语言函数中完全跨越了Go语言的内存管理，在PrintGoString调用前即使发生了栈伸缩导致的Go字符串地址发生变化也依然可以正常工作，因为该字符串对应的id是稳定的，在Go语言空间通过id解码得到的字符串也就是有效的。
+
+##### 导出C函数不能返回Go内存
+
+在Go语言中，Go是从一个固定的虚拟地址空间分配内存。而C语言分配的内存则不能使用Go语言保留的虚拟内存空间。在CGO环境，Go语言运行时默认会检查导出返回的内存是否是由Go语言分配的，如果是则会抛出运行时异常。
+
+下面是CGO运行时异常的例子：
+
+```go
+/*
+extern int* getGoPtr();
+
+static void Main() {
+    int* p = getGoPtr();
+    *p = 42;
+}
+*/
+import "C"
+
+func main() {
+    C.Main()
+}
+
+//export getGoPtr
+func getGoPtr() *C.int {
+    return new(C.int)
+}
+```
+
+其中getGoPtr返回的虽然是C语言类型的指针，但是内存本身是从Go语言的new函数分配，也就是由Go语言运行时统一管理的内存。然后我们在C语言的Main函数中调用了getGoPtr函数，此时默认将发送运行时异常：
+
+```
+$ go run main.go
+panic: runtime error: cgo result has Go pointer
+
+goroutine 1 [running]:
+main._cgoexpwrap_cfb3840e3af2_getGoPtr.func1(0xc420051dc0)
+  command-line-arguments/_obj/_cgo_gotypes.go:60 +0x3a
+main._cgoexpwrap_cfb3840e3af2_getGoPtr(0xc420016078)
+  command-line-arguments/_obj/_cgo_gotypes.go:62 +0x67
+main._Cfunc_Main()
+  command-line-arguments/_obj/_cgo_gotypes.go:43 +0x41
+main.main()
+  /Users/chai/go/src/github.com/chai2010 \
+  /advanced-go-programming-book/examples/ch2-xx \
+  /return-go-ptr/main.go:17 +0x20
+exit status 2
+```
+
+异常说明cgo函数返回的结果中含有Go语言分配的指针。指针的检查操作发生在C语言版的getGoPtr函数中，它是由cgo生成的桥接C语言和Go语言的函数。
+
+下面是cgo生成的C语言版本getGoPtr函数的具体细节（在cgo生成的`_cgo_export.c`文件定义）：
+
+```c
+int* getGoPtr()
+{
+    __SIZE_TYPE__ _cgo_ctxt = _cgo_wait_runtime_init_done();
+    struct {
+        int* r0;
+    } __attribute__((__packed__)) a;
+    _cgo_tsan_release();
+    crosscall2(_cgoexp_95d42b8e6230_getGoPtr, &a, 8, _cgo_ctxt);
+    _cgo_tsan_acquire();
+    _cgo_release_context(_cgo_ctxt);
+    return a.r0;
+}
+```
+
+其中`_cgo_tsan_acquire`是从LLVM项目移植过来的内存指针扫描函数，它会检查cgo函数返回的结果是否包含Go指针。
+
+需要说明的是，cgo默认对返回结果的指针的检查是有代价的，特别是cgo函数返回的结果是一个复杂的数据结构时将花费更多的时间。如果已经确保了cgo函数返回的结果是安全的话，可以通过设置环境变量`GODEBUG=cgocheck=0`来关闭指针检查行为。
+
+```
+$ GODEBUG=cgocheck=0 go run main.go
+```
+
+关闭cgocheck功能后再运行上面的代码就不会出现上面的异常的。但是要注意的是，如果C语言使用期间对应的内存被Go运行时释放了，将会导致更严重的崩溃问题。cgocheck默认的值是1，对应一个简化版本的检测，如果需要完整的检测功能可以将cgocheck设置为2。
+
+### 静态库和动态库
+
+##### 使用C静态库
+
+如果CGO中引入的C/C++资源有代码而且代码规模也比较小，直接使用源码是最理想的方式，但很多时候我们并没有源代码，或者从C/C++源代码开始构建的过程异常复杂，这种时候使用C静态库也是一个不错的选择。静态库因为是静态链接，最终的目标程序并不会产生额外的运行时依赖，也不会出现动态库特有的跨运行时资源管理的错误。不过静态库对链接阶段会有一定要求：静态库一般包含了全部的代码，里面会有大量的符号，如果不同静态库之间出现了符号冲突则会导致链接的失败。
+
+我们先用纯C语言构造一个简单的静态库。我们要构造的静态库名叫number，库中只有一个number_add_mod函数，用于表示数论中的模加法运算。number库的文件都在number目录下。
+
+`number/number.h`头文件只有一个纯C语言风格的函数声明：
+
+```c
+int number_add_mod(int a, int b, int mod);
+```
+
+`number/number.c`对应函数的实现：
+
+```c
+#include "number.h"
+
+int number_add_mod(int a, int b, int mod) {
+    return (a+b)%mod;
+}
+```
+
+因为CGO使用的是GCC命令来编译和链接C和Go桥接的代码。因此静态库也必须是GCC兼容的格式。
+
+通过以下命令可以生成一个叫libnumber.a的静态库：
+
+```
+$ cd ./number
+$ gcc -c -o number.o number.c
+$ ar rcs libnumber.a number.o
+```
+
+生成libnumber.a静态库之后，我们就可以在CGO中使用该资源了。
+
+创建main.go文件如下：
+
+```go
+package main
+
+//#cgo CFLAGS: -I./number
+//#cgo LDFLAGS: -L${SRCDIR}/number -lnumber
+//
+//#include "number.h"
+import "C"
+import "fmt"
+
+func main() {
+    fmt.Println(C.number_add_mod(10, 5, 12))
+}
+```
+
+其中有两个#cgo命令，分别是编译和链接参数。CFLAGS通过`-I./number`将number库对应头文件所在的目录加入头文件检索路径。LDFLAGS通过`-L${SRCDIR}/number`将编译后number静态库所在目录加为链接库检索路径，`-lnumber`表示链接libnumber.a静态库。需要注意的是，在链接部分的检索路径不能使用相对路径（C/C++代码的链接程序所限制），我们必须通过cgo特有的`${SRCDIR}`变量将源文件对应的当前目录路径展开为绝对路径（因此在windows平台中绝对路径不能有空白符号）。
+
+因为我们有number库的全部代码，所以我们可以用go generate工具来生成静态库，或者是通过Makefile来构建静态库。因此发布CGO源码包时，我们并不需要提前构建C静态库。
+
+因为多了一个静态库的构建步骤，这种使用了自定义静态库并已经包含了静态库全部代码的Go包无法直接用go get安装。不过我们依然可以通过go get下载，然后用go generate触发静态库构建，最后才是go install来完成安装。
+
+为了支持go get命令直接下载并安装，我们C语言的`#include`语法可以将number库的源文件链接到当前的包。
+
+创建`z_link_number_c.c`文件如下：
+
+```c
+#include "./number/number.c"
+```
+
+然后在执行go get或go build之类命令的时候，CGO就是自动构建number库对应的代码。这种技术是在不改变静态库源代码组织结构的前提下，将静态库转化为了源代码方式引用。这种CGO包是最完美的。
+
+如果使用的是第三方的静态库，我们需要先下载安装静态库到合适的位置。然后在#cgo命令中通过CFLAGS和LDFLAGS来指定头文件和库的位置。对于不同的操作系统甚至同一种操作系统的不同版本来说，这些库的安装路径可能都是不同的，那么如何在代码中指定这些可能变化的参数呢？
+
+在Linux环境，有一个pkg-config命令可以查询要使用某个静态库或动态库时的编译和链接参数。我们可以在#cgo命令中直接使用pkg-config命令来生成编译和链接参数。而且还可以通过PKG_CONFIG环境变量定制pkg-config命令。因为不同的操作系统对pkg-config命令的支持不尽相同，通过该方式很难兼容不同的操作系统下的构建参数。不过对于Linux等特定的系统，pkg-config命令确实可以简化构建参数的管理。关于pkg-config的使用细节在此我们不深入展开，大家可以自行参考相关文档。
+
+
+
+##### 使用C动态库
+
+动态库出现的初衷是对于相同的库，多个进程可以共享同一个，以节省内存和磁盘资源。但是在磁盘和内存已经白菜价的今天，这两个作用已经显得微不足道了，那么除此之外动态库还有哪些存在的价值呢？从库开发角度来说，动态库可以隔离不同动态库之间的关系，减少链接时出现符号冲突的风险。而且对于windows等平台，动态库是跨越VC和GCC不同编译器平台的唯一的可行方式。
+
+对于CGO来说，使用动态库和静态库是一样的，因为动态库也必须要有一个小的静态导出库用于链接动态库（Linux下可以直接链接so文件，但是在Windows下必须为dll创建一个`.a`文件用于链接）。我们还是以前面的number库为例来说明如何以动态库方式使用。
+
+对于在macOS和Linux系统下的gcc环境，我们可以用以下命令创建number库的的动态库：
+
+```
+$ cd number
+$ gcc -shared -o libnumber.so number.c
+```
+
+因为动态库和静态库的基础名称都是libnumber，只是后缀名不同而已。因此Go语言部分的代码和静态库版本完全一样：
+
+```go
+package main
+
+//#cgo CFLAGS: -I./number
+//#cgo LDFLAGS: -L${SRCDIR}/number -lnumber
+//
+//#include "number.h"
+import "C"
+import "fmt"
+
+func main() {
+    fmt.Println(C.number_add_mod(10, 5, 12))
+}
+```
+
+编译时GCC会自动找到libnumber.a或libnumber.so进行链接。
+
+对于windows平台，我们还可以用VC工具来生成动态库（windows下有一些复杂的C++库只能用VC构建）。我们需要先为number.dll创建一个def文件，用于控制要导出到动态库的符号。
+
+number.def文件的内容如下：
+
+```
+LIBRARY number.dll
+
+EXPORTS
+number_add_mod
+```
+
+其中第一行的LIBRARY指明动态库的文件名，然后的EXPORTS语句之后是要导出的符号名列表。
+
+现在我们可以用以下命令来创建动态库（需要进入VC对应的x64命令行环境）。
+
+```
+$ cl /c number.c
+$ link /DLL /OUT:number.dll number.obj number.def
+```
+
+这时候会为dll同时生成一个number.lib的导出库。但是在CGO中我们无法使用lib格式的链接库。
+
+要生成`.a`格式的导出库需要通过mingw工具箱中的dlltool命令完成：
+
+```
+$ dlltool -dllname number.dll --def number.def --output-lib libnumber.a
+```
+
+生成了libnumber.a文件之后，就可以通过`-lnumber`链接参数进行链接了。
+
+需要注意的是，在运行时需要将动态库放到系统能够找到的位置。对于windows来说，可以将动态库和可执行程序放到同一个目录，或者将动态库所在的目录绝对路径添加到PATH环境变量中。对于macOS来说，需要设置DYLD_LIBRARY_PATH环境变量。而对于Linux系统来说，需要设置LD_LIBRARY_PATH环境变量。
+
+##### 导出C静态库
+
+CGO不仅可以使用C静态库，也可以将Go实现的函数导出为C静态库。我们现在用Go实现前面的number库的模加法函数。
+
+创建number.go，内容如下：
+
+```go
+package main
+
+import "C"
+
+func main() {}
+
+//export number_add_mod
+func number_add_mod(a, b, mod C.int) C.int {
+    return (a + b) % mod
+}
+```
+
+根据CGO文档的要求，我们需要在main包中导出C函数。对于C静态库构建方式来说，会忽略main包中的main函数，只是简单导出C函数。采用以下命令构建：
+
+```
+$ go build -buildmode=c-archive -o number.a
+```
+
+在生成number.a静态库的同时，cgo还会生成一个number.h文件。
+
+number.h文件的内容如下（为了便于显示，内容做了精简）：
+
+```c
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern int number_add_mod(int p0, int p1, int p2);
+
+#ifdef __cplusplus
+}
+#endif
+```
+
+其中`extern "C"`部分的语法是为了同时适配C和C++两种语言。核心内容是声明了要导出的number_add_mod函数。
+
+然后我们创建一个`_test_main.c`的C文件用于测试生成的C静态库（用下划线作为前缀名是让为了让go build构建C静态库时忽略这个文件）：
+
+```c
+#include "number.h"
+
+#include <stdio.h>
+
+int main() {
+    int a = 10;
+    int b = 5;
+    int c = 12;
+
+    int x = number_add_mod(a, b, c);
+    printf("(%d+%d)%%%d = %d\n", a, b, c, x);
+
+    return 0;
+}
+```
+
+通过以下命令编译并运行：
+
+```
+$ gcc -o a.out _test_main.c number.a
+$ ./a.out
+```
+
+使用CGO创建静态库的过程非常简单。
+
+##### 导出C动态库
+
+CGO导出动态库的过程和静态库类似，只是将构建模式改为`c-shared`，输出文件名改为`number.so`而已：
+
+```
+$ go build -buildmode=c-shared -o number.so
+```
+
+`_test_main.c`文件内容不变，然后用以下命令编译并运行：
+
+```
+$ gcc -o a.out _test_main.c number.so
+$ ./a.out
+```
+
+
+
+##### 导出非main包
+
+通过`go help buildmode`命令可以查看C静态库和C动态库的构建说明：
+
+```
+-buildmode=c-archive
+    Build the listed main package, plus all packages it imports,
+    into a C archive file. The only callable symbols will be those
+    functions exported using a cgo //export comment. Requires
+    exactly one main package to be listed.
+
+-buildmode=c-shared
+    Build the listed main package, plus all packages it imports,
+    into a C shared library. The only callable symbols will
+    be those functions exported using a cgo //export comment.
+    Requires exactly one main package to be listed.
+```
+
+文档说明导出的C函数必须是在main包导出，然后才能在生成的头文件包含声明的语句。但是很多时候我们可能更希望将不同类型的导出函数组织到不同的Go包中，然后统一导出为一个静态库或动态库。
+
+要实现从是从非main包导出C函数，或者是多个包导出C函数（因为只能有一个main包），我们需要自己提供导出C函数对应的头文件（因为CGO无法为非main包的导出函数生成头文件）。
+
+假设我们先创建一个number子包，用于提供模加法函数：
+
+```go
+package number
+
+import "C"
+
+//export number_add_mod
+func number_add_mod(a, b, mod C.int) C.int {
+    return (a + b) % mod
+}
+```
+
+然后是当前的main包：
+
+```go
+package main
+
+import "C"
+
+import (
+    "fmt"
+
+    _ "./number"
+)
+
+func main() {
+    println("Done")
+}
+
+//export goPrintln
+func goPrintln(s *C.char) {
+    fmt.Println("goPrintln:", C.GoString(s))
+}
+```
+
+其中我们导入了number子包，在number子包中有导出的C函数number_add_mod，同时我们在main包也导出了goPrintln函数。
+
+通过以下命令创建C静态库：
+
+```
+$ go build -buildmode=c-archive -o main.a
+```
+
+这时候在生成main.a静态库的同时，也会生成一个main.h头文件。但是main.h头文件中只有main包中导出的goPrintln函数的声明，并没有number子包导出函数的声明。其实number_add_mod函数在生成的C静态库中是存在的，我们可以直接使用。
+
+创建`_test_main.c`测试文件如下：
+
+```c
+#include <stdio.h>
+
+void goPrintln(char*);
+int number_add_mod(int a, int b, int mod);
+
+int main() {
+    int a = 10;
+    int b = 5;
+    int c = 12;
+
+    int x = number_add_mod(a, b, c);
+    printf("(%d+%d)%%%d = %d\n", a, b, c, x);
+
+    goPrintln("done");
+    return 0;
+}
+```
+
+我们并没有包含CGO自动生成的main.h头文件，而是通过手工方式声明了goPrintln和number_add_mod两个导出函数。这样我们就实现了从多个Go包导出C函数了。
+
+### 编译和链接参数
+
+##### 编译和链接参数
+
+编译和链接参数是每一个C/C++程序员需要经常面对的问题。构建每一个C/C++应用均需要经过编译和链接两个步骤，CGO也是如此。 本节我们将简要讨论CGO中经常用到的编译和链接参数的用法。
+
+
+
+##### 编译参数：CFLAGS/CPPFLAGS/CXXFLAGS
+
+编译参数主要是头文件的检索路径，预定义的宏等参数。理论上来说C和C++是完全独立的两个编程语言，它们可以有着自己独立的编译参数。 但是因为C++语言对C语言做了深度兼容，甚至可以将C++理解为C语言的超集，因此C和C++语言之间又会共享很多编译参数。 因此CGO提供了CFLAGS/CPPFLAGS/CXXFLAGS三种参数，其中CFLAGS对应C语言编译参数(以`.c`后缀名)、 CPPFLAGS对应C/C++ 代码编译参数(*.c,*.cc,*.cpp,*.cxx)、CXXFLAGS对应纯C++编译参数(*.cc,*.cpp,*.cxx)。
+
+
+
+##### 链接参数：LDFLAGS
+
+链接参数主要包含要链接库的检索目录和要链接库的名字。因为历史遗留问题，链接库不支持相对路径，我们必须为链接库指定绝对路径。 cgo 中的 ${SRCDIR} 为当前目录的绝对路径。经过编译后的C和C++目标文件格式是一样的，因此LDFLAGS对应C/C++共同的链接参数。
+
+
+
+##### pkg-config
+
+为不同C/C++库提供编译和链接参数是一项非常繁琐的工作，因此cgo提供了对应`pkg-config`工具的支持。 我们可以通过`#cgo pkg-config xxx`命令来生成xxx库需要的编译和链接参数，其底层通过调用 `pkg-config xxx --cflags`生成编译参数，通过`pkg-config xxx --libs`命令生成链接参数。 需要注意的是`pkg-config`工具生成的编译和链接参数是C/C++公用的，无法做更细的区分。
+
+`pkg-config`工具虽然方便，但是有很多非标准的C/C++库并没有实现对其支持。 这时候我们可以手工为`pkg-config`工具创建对应库的编译和链接参数实现支持。
+
+比如有一个名为xxx的C/C++库，我们可以手工创建`/usr/local/lib/pkgconfig/xxx.bc`文件：
+
+```
+Name: xxx
+Cflags:-I/usr/local/include
+Libs:-L/usr/local/lib –lxxx2
+```
+
+其中Name是库的名字，Cflags和Libs行分别对应xxx使用库需要的编译和链接参数。如果bc文件在其它目录， 可以通过PKG_CONFIG_PATH环境变量指定`pkg-config`工具的检索目录。
+
+而对应cgo来说，我们甚至可以通过PKG_CONFIG 环境变量可指定自定义的pkg-config程序。 如果是自己实现CGO专用的pkg-config程序，只要处理`--cflags`和`--libs`两个参数即可。
+
+下面的程序是macos系统下生成Python3的编译和链接参数：
+
+```go
+// py3-config.go
+func main() {
+    for _, s := range os.Args {
+        if s == "--cflags" {
+            out, _ := exec.Command("python3-config", "--cflags").CombinedOutput()
+            out = bytes.Replace(out, []byte("-arch"), []byte{}, -1)
+            out = bytes.Replace(out, []byte("i386"), []byte{}, -1)
+            out = bytes.Replace(out, []byte("x86_64"), []byte{}, -1)
+            fmt.Print(string(out))
+            return
+        }
+        if s == "--libs" {
+            out, _ := exec.Command("python3-config", "--ldflags").CombinedOutput()
+            fmt.Print(string(out))
+            return
+        }
+    }
+}
+```
+
+然后通过以下命令构建并使用自定义的`pkg-config`工具：
+
+```
+$ go build -o py3-config py3-config.go
+$ PKG_CONFIG=./py3-config go build -buildmode=c-shared -o gopkg.so main.go
+```
+
+##### go get 链
+
+在使用`go get`获取Go语言包的同时会获取包依赖的包。比如A包依赖B包，B包依赖C包，C包依赖D包： `pkgA -> pkgB -> pkgC -> pkgD -> ...`。再go get获取A包之后会依次线获取BCD包。 如果在获取B包之后构建失败，那么将导致链条的断裂，从而导致A包的构建失败。
+
+链条断裂的原因有很多，其中常见的原因有：
+
+- 不支持某些系统, 编译失败
+- 依赖 cgo, 用户没有安装 gcc
+- 依赖 cgo, 但是依赖的库没有安装
+- 依赖 pkg-config, windows 上没有安装
+- 依赖 pkg-config, 没有找到对应的 bc 文件
+- 依赖 自定义的 pkg-config, 需要额外的配置
+- 依赖 swig, 用户没有安装 swig, 或版本不对
+
+仔细分析可以发现，失败的原因中和CGO相关的问题占了绝大多数。这并不是偶然现象， 自动化构建C/C++代码一直是一个世界难题，到目前位置也没有出现一个大家认可的统一的C/C++管理工具。
+
+因为用了cgo，比如gcc等构建工具是必须安装的，同时尽量要做到对主流系统的支持。 如果依赖的C/C++包比较小并且有源代码的前提下，可以优先选择从代码构建。
+
+比如`github.com/chai2010/webp`包通过为每个C/C++源文件在当前包建立关键文件实现零配置依赖：
+
+```
+// z_libwebp_src_dec_alpha.c
+#include "./internal/libwebp/src/dec/alpha.c"
+```
+
+因此在编译`z_libwebp_src_dec_alpha.c`文件时，会编译libweb原生的代码。 其中的依赖是相对目录，对于不同的平台支持可以保持最大的一致性。
+
+##### 多个非main包中导出C函数
+
+官方文档说明导出的Go函数要放main包，但是真实情况是其它包的Go导出函数也是有效的。 因为导出后的Go函数就可以当作C函数使用，所以必须有效。但是不同包导出的Go函数将在同一个全局的名字空间，因此需要小心避免重名的问题。 如果是从不同的包导出Go函数到C语言空间，那么cgo自动生成的`_cgo_export.h`文件将无法包含全部到处的函数声明， 我们必须通过手写头文件的方式什么导出的全部函数。
 
 ## 任务布置的理解
 
-用户传数据 失败之后返回信息
-
-
-
-go build -o 生成动态链接库
-
-
+#### .bat文件的书写
 
 动态链接库的方法在main.go里面定义
-
-
 
 4个回调方法，有些函数不需要回调 
 
@@ -1415,15 +2336,13 @@ go build -o 生成动态链接库
 
 传参是C的数据类型 ->转换成go的数据类型->进行逻辑操作->打包成dll
 
-
-
 任务布置：写一个C字符串进来 转成go 然后printf
 
 ```
 就是现在的项目不是有个c的demo，调用go导出的dll，你也可以照着他的写，先export个方法，可以传进来个字符串，你打印下，或者传个数组进来你排序下，然后生成为dll，在c里调用测试下可以
 ```
 
-
+任务更新链接：https://github.com/gebilxs/cgoLearn/tree/master/LearningDemo
 
 
 
