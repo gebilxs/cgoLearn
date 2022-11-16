@@ -1245,6 +1245,156 @@ func runtime.cgocallback(fn, frame unsafe.Pointer, framesize, ctxt uintptr)
 
 其中`runtime.cgocallback`函数是实现C语言到Go语言函数跨界调用的关键。更详细的细节可以参考相关函数的实现。
 
+
+
+### 实战封装qsort
+
+##### 认识qsort
+
+qsort快速排序函数有`<stdlib.h>`标准库提供，函数的声明如下：
+
+```c
+void qsort(
+    void* base, size_t num, size_t size,
+    int (*cmp)(const void*, const void*)
+);
+```
+
+其中base参数是要排序数组的首个元素的地址，num是数组中元素的个数，size是数组中每个元素的大小。最关键是cmp比较函数，用于对数组中任意两个元素进行排序。cmp排序函数的两个指针参数分别是要比较的两个元素的地址，如果第一个参数对应元素大于第二个参数对应的元素将返回结果大于0，如果两个元素相等则返回0，如果第一个元素小于第二个元素则返回结果小于0。
+
+下面的例子是用C语言的qsort对一个int类型的数组进行排序：
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+#define DIM(x) (sizeof(x)/sizeof((x)[0]))
+
+static int cmp(const void* a, const void* b) {
+    const int* pa = (int*)a;
+    const int* pb = (int*)b;
+    return *pa - *pb;
+}
+
+int main() {
+    int values[] = { 42, 8, 109, 97, 23, 25 };
+    int i;
+
+    qsort(values, DIM(values), sizeof(values[0]), cmp);
+
+    for(i = 0; i < DIM(values); i++) {
+        printf ("%d ",values[i]);
+    }
+    return 0;
+}
+```
+
+![image-20221116083325977](cgo/image-20221116083325977.png)
+
+其中`DIM(values)`宏用于计算数组元素的个数，`sizeof(values[0])`用于计算数组元素的大小。 cmp是用于排序时比较两个元素大小的回调函数。为了避免对全局名字空间的污染，我们将cmp回调函数定义为仅当前文件内可访问的静态函数。
+
+##### 将qsort函数从go导出
+
+为了方便Go语言的非CGO用户使用qsort函数，我们需要将C语言的qsort函数包装为一个外部可以访问的Go函数。
+
+用Go语言将qsort函数重新包装为`qsort.Sort`函数：
+
+```go
+package qsort
+
+//typedef int (*qsort_cmp_func_t)(const void* a, const void* b);
+import "C"
+import "unsafe"
+
+func Sort(
+    base unsafe.Pointer, num, size C.size_t,
+    cmp C.qsort_cmp_func_t,
+) {
+    C.qsort(base, num, size, cmp)
+}
+```
+
+因为Go语言的CGO语言不好直接表达C语言的函数类型，因此在C语言空间将比较函数类型重新定义为一个`qsort_cmp_func_t`类型。
+
+虽然Sort函数已经导出了，但是对于qsort包之外的用户依然不能直接使用该函数——Sort函数的参数还包含了虚拟的C包提供的类型。 在CGO的内部机制一节中我们已经提过，虚拟的C包下的任何名称其实都会被映射为包内的私有名字。比如`C.size_t`会被展开为`_Ctype_size_t`，`C.qsort_cmp_func_t`类型会被展开为`_Ctype_qsort_cmp_func_t`。
+
+
+
+被CGO处理后的Sort函数的类型如下：
+
+```go
+func Sort(
+    base unsafe.Pointer, num, size _Ctype_size_t,
+    cmp _Ctype_qsort_cmp_func_t,
+)
+```
+
+这样将会导致包外部用于无法构造`_Ctype_size_t`和`_Ctype_qsort_cmp_func_t`类型的参数而无法使用Sort函数。因此，导出的Sort函数的参数和返回值要避免对虚拟C包的依赖。
+
+重新调整Sort函数的参数类型和实现如下：
+
+```go
+/*
+#include <stdlib.h>
+
+typedef int (*qsort_cmp_func_t)(const void* a, const void* b);
+*/
+import "C"
+import "unsafe"
+
+type CompareFunc C.qsort_cmp_func_t
+
+func Sort(base unsafe.Pointer, num, size int, cmp CompareFunc) {
+    C.qsort(base, C.size_t(num), C.size_t(size), C.qsort_cmp_func_t(cmp))
+}
+```
+
+我们将虚拟C包中的类型通过Go语言类型代替，在内部调用C函数时重新转型为C函数需要的类型。因此外部用户将不再依赖qsort包内的虚拟C包。
+
+以下代码展示的Sort函数的使用方式：
+
+```go
+package main
+
+//extern int go_qsort_compare(void* a, void* b);
+import "C"
+
+import (
+    "fmt"
+    "unsafe"
+
+    qsort "."
+)
+
+//export go_qsort_compare
+func go_qsort_compare(a, b unsafe.Pointer) C.int {
+    pa, pb := (*C.int)(a), (*C.int)(b)
+    return C.int(*pa - *pb)
+}
+
+func main() {
+    values := []int32{42, 9, 101, 95, 27, 25}
+
+    qsort.Sort(unsafe.Pointer(&values[0]),
+        len(values), int(unsafe.Sizeof(values[0])),
+        qsort.CompareFunc(C.go_qsort_compare),
+    )
+    fmt.Println(values)
+}
+```
+
+为了使用Sort函数，我们需要将Go语言的切片取首地址、元素个数、元素大小等信息作为调用参数，同时还需要提供一个C语言规格的比较函数。 其中go_qsort_compare是用Go语言实现的，并导出到C语言空间的函数，用于qsort排序时的比较函数。
+
+目前已经实现了对C语言的qsort初步包装，并且可以通过包的方式被其它用户使用。但是`qsort.Sort`函数已经有很多不便使用之处：用户要提供C语言的比较函数，这对许多Go语言用户是一个挑战。下一步我们将继续改进qsort函数的包装函数，尝试通过闭包函数代替C语言的比较函数。
+
+消除用户对CGO代码的直接依赖。
+
+
+
+##### 改进：闭包函数作为比较函数
+
+
+
 ## 任务布置的理解
 
 用户传数据 失败之后返回信息
