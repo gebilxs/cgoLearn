@@ -51,5 +51,35 @@ func numbers(addr unsafe.Pointer, lens C.int) {
 	arrHeader.Cap = int(lens)
 	//分配cap
 	//arr = arrHeader.Data
+
+	quickSort(arr, 0, 9)
 	fmt.Println(arr)
+
+}
+
+//export quickSort
+func quickSort(nums []int, l, r int) { //[l,r]
+	if l < r {
+		m := partition(nums, l, r)
+		quickSort(nums, l, m-1)
+		quickSort(nums, m+1, r)
+	}
+}
+
+//export partition
+func partition(nums []int, l int, r int) int {
+	key := nums[r]
+	//all in [l,i) < key
+	//all in [i,j] > key
+	i := l
+	j := l
+	for j < r {
+		if nums[j] < key {
+			nums[i], nums[j] = nums[j], nums[i]
+			i++
+		}
+		j++
+	}
+	nums[i], nums[r] = nums[r], nums[i]
+	return i
 }

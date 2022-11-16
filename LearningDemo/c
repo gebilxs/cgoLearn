@@ -79,6 +79,8 @@ extern "C" {
 extern __declspec(dllexport) int handler(int a, int b);
 extern __declspec(dllexport) void printChar(char* str);
 extern __declspec(dllexport) void numbers(void* addr, int lens);
+extern __declspec(dllexport) void quickSort(GoSlice nums, GoInt l, GoInt r);
+extern __declspec(dllexport) GoInt partition(GoSlice nums, GoInt l, GoInt r);
 
 #ifdef __cplusplus
 }
