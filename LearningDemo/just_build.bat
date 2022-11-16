@@ -7,9 +7,6 @@ IF %errorlevel% NEQ 0 GOTO ERROR
 echo build dll success.
 copy libsoe.dll c
 copy libsoe.h c
-cd go
-run.bat
-cd ..
 GOTO END
 :ERROR
     echo build dll failed.
